@@ -9,11 +9,13 @@
 #include <atomic>
 #include <deque>
 #include <ctime>
-
+#include <unistd.h>
 
 using namespace std;
 
-
+pthread_mutex_t mutex0 = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t mutex1 = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t mutex2 = PTHREAD_MUTEX_INITIALIZER;
 
 template<typename K, typename V>
 class Node;
@@ -24,32 +26,23 @@ class SkipList;
 template<typename K, typename V>
 using node_ptr = std::shared_ptr<Node<K, V>>;
 
+// NODO
 template<typename K, typename V>
-class Node{
-
-public:
+struct Node{
     using node_ptr = std::shared_ptr<Node<K, V>>;
-
     Node();
     Node(const K&, const V&, int level);
     ~Node();
-
     K get_key() const;
     V get_value() const;
     int get_level() const;
-
-
     friend SkipList<K, V>;
-
-private:
     int level_;
-
     const K key_;
     V value_;
     std::vector<node_ptr> forward_;
-
-    void unlink();
 };
+
 
 template<typename K, typename V>
 Node<K, V>::Node() = default;
@@ -72,12 +65,8 @@ int Node<K, V>::get_level() const {
 }
 
 
-template<typename K, typename V>
-void Node<K, V>::unlink() {
-    for (auto &p:forward_) {
-        p = nullptr;
-    }
-}
+
+// SKIP LIST
 
 template<typename K, typename V>
 class SkipList {
@@ -89,32 +78,32 @@ public:
     node_ptr<K, V> create_node(const K&, const V&, int level);
 
     bool search(const K&) const;
-    void insert(const K&, const V&);
+    void insert( K,  V);
     int index;
     int nt;
 
     node_ptr<K, V> erase(const K&);
 
-    std::vector<node_ptr<K, V>> erase_all(const K&);
-    std::vector<node_ptr<K, V>> erase_range(const K& lower, const K& upper);
 
     void print_list() const ;
     void print_level_size() const ;
-
     int size() const;
     int get_max_level() const;
 private:
+
+    int current_key;
     node_ptr<K, V> search_ptr(const K&) const;
 
-    std::vector<node_ptr<K, V>> get_previous_ptr(const K& k);
+    std::vector<node_ptr<K, V>> get_updates(K k);
 
-    int  get_random_level();
+    int  random_level();
 
     int current_level_;
 
     int max_level_;
 
     std::atomic<int> element_count_;
+
     node_ptr<K, V> head_;
 
     /* concurrency support */
@@ -134,20 +123,17 @@ node_ptr<K, V> SkipList<K, V>::create_node(const K &k, const V &v, int level) {
 
 template<typename K, typename V>
 SkipList<K, V>::SkipList(int level): max_level_(level), element_count_(0) {
-    //TODO: there is a little issue: k, v can be initialized by default constructor.
-    //Solution: Use a Base node that has its default construcor.
-    static_assert(std::is_default_constructible<K>(),"The Key type must has default constructor");
-    static_assert(std::is_default_constructible<V>(), "The Key type must has default constructor");
     K k;
     V v;
     index = 0;
     head_ = create_node(k, v, max_level_);
+    current_key = -1;
 }
 
 
 template<typename K, typename V>
 node_ptr<K, V> SkipList<K, V>::search_ptr(const K &k) const {
-    std::shared_lock<std::shared_mutex> sharedLock(m);
+//    std::shared_lock<std::shared_mutex> sharedLock(m);
     node_ptr<K, V> prev = this->head_;
     for (int i = this->max_level_ - 1; i >= 0; --i) {
         while (prev->forward_[i] != nullptr && prev->forward_[i]->key_ < k) {
@@ -161,29 +147,28 @@ node_ptr<K, V> SkipList<K, V>::search_ptr(const K &k) const {
 }
 
 template<typename K, typename V>
-std::vector<node_ptr<K, V>> SkipList<K, V>::get_previous_ptr(const K &k) {
-
-    std::vector<node_ptr<K, V>> prev(this->max_level_, this->head_);
+std::vector<node_ptr<K, V>> SkipList<K, V>::get_updates(K k) {
+    std::vector<node_ptr<K, V>> update(this->max_level_, this->head_);
     node_ptr<K, V> curr = this->head_;
     for (int i = this->max_level_ - 1; i >= 0; --i) {
-        while (curr->forward_[i] != nullptr && curr->forward_[i]->key_ < k) {
+        while (curr->forward_[i]  && curr->forward_[i]->key_ < k) {
             curr = curr->forward_[i];
         }
-        prev[i] = curr;
+        update[i] = curr;
     }
-    return prev;
-
+    return update;
 }
 
 template<typename K, typename V>
 bool SkipList<K, V>::search(const K &k) const {
+
     return search_ptr(k) != nullptr;
 }
 
 
 template<typename K, typename V>
 void SkipList<K, V>::print_list() const {
-    /* Read lock */
+
     std::shared_lock<std::shared_mutex> sharedLock(m);
     for (int i = this->max_level_ - 1; i >= 0; --i) {
          printf("Level %d : ", i);
@@ -197,16 +182,18 @@ void SkipList<K, V>::print_list() const {
 }
 
 template<typename K, typename V>
-void SkipList<K, V>::insert(const K &k, const V &v) {
-    /*  write lock */
-    std::unique_lock<std::shared_mutex> uniqueLock(m);
-//    for(int i = (time(NULL) + nt); time(0) != i; time(0));
-    node_ptr<K, V> node = create_node(k, v, get_random_level());
-    auto previous_ptrs = get_previous_ptr(k);
-    for (int i = node->get_level() - 1; i >= 0; --i) {
-        node->forward_[i] = previous_ptrs[i]->forward_[i];
-        previous_ptrs[i]->forward_[i] = node;
+void SkipList<K, V>::insert(K k,  V v) {
+
+    auto updates = get_updates(k);
+    node_ptr<K, V> node = create_node(k, v, random_level());
+
+    //updates
+    for (int i = node->get_level() - 1; i >= 0; --i)
+    {
+        node->forward_[i] = updates[i]->forward_[i];
+        updates[i]->forward_[i] = node;
     }
+    current_key = -1;
     ++element_count_;
     index++;
 }
@@ -219,16 +206,17 @@ int SkipList<K, V>::size() const {
 
 template<typename K, typename V>
 node_ptr<K, V> SkipList<K, V>::erase(const K& k) {
-    /*  write lock */
-    std::unique_lock<std::shared_mutex> uniqueLock(m);
-    auto update = get_previous_ptr(k);
 
-    /* not found key */
+//    std::unique_lock<std::shared_mutex> uniqueLock(m);
+
+    auto update = get_updates(k);
+
+    // not found key
     if (update[0]->forward_[0] == nullptr || update[0]->forward_[0]->key_ != k) {
         return nullptr;
     }
 
-    /* return the node ptr */
+
     auto return_ptr = update[0]->forward_[0];
     for (int i = 0; i < update.size(); ++i) {
         if (update[i]->forward_[i] != return_ptr) {
@@ -242,7 +230,7 @@ node_ptr<K, V> SkipList<K, V>::erase(const K& k) {
 
 
 template<typename K, typename V>
-int SkipList<K, V>::get_random_level() {
+int SkipList<K, V>::random_level() {
     int k = 1;
     while (rand() % 2) {
         k++;
@@ -254,7 +242,7 @@ int SkipList<K, V>::get_random_level() {
 template<typename  K, typename V>
 void SkipList<K, V>::print_level_size() const {
     /* Read lock */
-    std::shared_lock<std::shared_mutex> sharedLock(m);
+//    std::shared_lock<std::shared_mutex> sharedLock(m);
     for (int i = this->max_level_ - 1; i >= 0; --i) {
         int level_size = 0;
         auto p = head_;
